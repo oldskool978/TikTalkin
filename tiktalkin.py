@@ -1,19 +1,24 @@
-"""
-TikTalkin Sovereign Tokenizer Python Client
-Zero-dependency, standalone drop-in replacement for tiktoken with O(1) SIMD lookup.
-"""
-
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import ctypes
 import os
 from pathlib import Path
 import sys
-from typing import List, Optional, Sequence, Union
+from typing import Collection, Iterable, List, Optional, Sequence, Set, Union
 
 ROOT_DIR = Path(__file__).resolve().parent
 IS_WIN = sys.platform == "win32"
 _DLL_NAME = "tiktalkin.dll" if IS_WIN else "libtiktalkin.so"
+
+
+class SpecialDisk(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("id", ctypes.c_int32),
+        ("length", ctypes.c_uint16),
+        ("literal", ctypes.c_char * 58),
+    ]
 
 
 class Telemetry(ctypes.Structure):
@@ -76,19 +81,34 @@ class _TikTalkinBinding:
         ]
         self.lib.tiktalkin_compile_vocab_with_telemetry.restype = ctypes.c_int32
 
+        self.lib.tiktalkin_compile_vocab_v4.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.POINTER(SpecialDisk),
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_char_p,
+            ctypes.POINTER(Telemetry),
+        ]
+        self.lib.tiktalkin_compile_vocab_v4.restype = ctypes.c_int32
+
 
 def _locate_native_library() -> Path:
     candidates = [
         ROOT_DIR / _DLL_NAME,
         ROOT_DIR / "dist" / "bin" / _DLL_NAME,
         ROOT_DIR / "build" / _DLL_NAME,
-        Path(os.environ.get("TIKTALKIN_DLL_PATH", "")),
     ]
+    env_override = os.environ.get("TIKTALKIN_DLL_PATH")
+    if env_override:
+        candidates.insert(0, Path(env_override).resolve())
+
     for candidate in candidates:
         if candidate.is_file():
             return candidate.resolve()
     raise FileNotFoundError(
-        f"Unable to locate {_DLL_NAME}. Ensure the library is compiled in dist/bin/ or adjacent to tiktalkin.py."
+        f"Unable to locate {_DLL_NAME}. Placed native binary required in {ROOT_DIR}."
     )
 
 
@@ -106,6 +126,9 @@ def compile_vocab(
     in_tiktoken_path: Union[str, Path],
     out_bin_path: Union[str, Path],
     out_telemetry_json: Optional[Union[str, Path]] = None,
+    regex_pattern: Optional[str] = None,
+    specials_list: Optional[Sequence[tuple[str, int]]] = None,
+    eot_token_id: int = 151643,
 ) -> Telemetry:
     binding = get_binding()
     in_path_str = str(Path(in_tiktoken_path).resolve()).encode("utf-8")
@@ -115,11 +138,27 @@ def compile_vocab(
         if out_telemetry_json
         else None
     )
+    pat_str = regex_pattern.encode("utf-8") if regex_pattern else None
+
+    specials_arr = None
+    specials_count = 0
+    if specials_list:
+        specials_count = len(specials_list)
+        specials_arr = (SpecialDisk * specials_count)()
+        for idx, (literal, s_id) in enumerate(specials_list):
+            specials_arr[idx].id = int(s_id)
+            lit_bytes = literal.encode("utf-8")[:57]
+            specials_arr[idx].length = len(lit_bytes)
+            specials_arr[idx].literal = lit_bytes
 
     telem = Telemetry()
-    rc = binding.lib.tiktalkin_compile_vocab_with_telemetry(
+    rc = binding.lib.tiktalkin_compile_vocab_v4(
         in_path_str,
         out_path_str,
+        pat_str,
+        specials_arr,
+        specials_count,
+        int(eot_token_id),
         telem_path_str,
         ctypes.byref(telem),
     )
@@ -138,7 +177,7 @@ def compile_qwen_ranks_binary(
         if not vocab_path.exists():
             matches = list(src.rglob("*.tiktoken"))
             if not matches:
-                raise FileNotFoundError(f"No .tiktoken file found in {src}")
+                raise FileNotFoundError(f"No .tiktoken file located in {src}")
             vocab_path = matches[0]
     else:
         vocab_path = src
@@ -189,30 +228,19 @@ class Encoding:
             search_candidates = [
                 ROOT_DIR / "qwen.ranks.bin",
                 ROOT_DIR / "dist" / "bin" / "qwen.ranks.bin",
-                ROOT_DIR.parent / "qwen.ranks.bin",
             ]
+            env_ranks = os.environ.get("TIKTALKIN_RANKS_PATH")
+            if env_ranks:
+                search_candidates.insert(0, Path(env_ranks).resolve())
+
             for cand in search_candidates:
                 if cand.is_file():
                     resolved_ranks = cand
                     break
 
         if resolved_ranks is None or not resolved_ranks.exists():
-            tik_search = [
-                ROOT_DIR / "qwen.tiktoken",
-                ROOT_DIR.parent / "qwen.tiktoken",
-            ]
-            for tik_cand in tik_search:
-                if tik_cand.is_file():
-                    bin_dest = tik_cand.with_suffix(".ranks.bin")
-                    if not bin_dest.exists():
-                        compile_vocab(tik_cand, bin_dest)
-                    resolved_ranks = bin_dest
-                    break
-
-        if resolved_ranks is None or not resolved_ranks.exists():
             raise FileNotFoundError(
-                "Could not resolve qwen.ranks.bin or qwen.tiktoken. "
-                "Provide an explicit ranks_path or ensure binaries are present in dist/bin/."
+                f"Could not resolve ranks container. Placed binary required in {ROOT_DIR}."
             )
 
         self._ranks_path = resolved_ranks
@@ -221,6 +249,12 @@ class Encoding:
             raise RuntimeError(f"Failed to initialize TikTalkin context from {self._ranks_path}")
 
         self._n_vocab = 184704
+        self._eot_token = 151643
+        self._special_tokens_set = {
+            "<|endoftext|>", "<|im_start|>", "<|im_end|>", "<R>", "<S>", "<X>", "<mask|>", "<sep>",
+            "<abc>", "</abc>", "<extra_198>", "<extra_199>",
+            *(f"<extra_{i}>" for i in range(196)),
+        }
 
     def __del__(self):
         if hasattr(self, "_ctx") and self._ctx:
@@ -234,6 +268,14 @@ class Encoding:
     @property
     def n_vocab(self) -> int:
         return self._n_vocab
+
+    @property
+    def eot_token(self) -> int:
+        return self._eot_token
+
+    @property
+    def special_tokens_set(self) -> Set[str]:
+        return self._special_tokens_set
 
     def encode_ordinary(self, text: str) -> List[int]:
         if not text:
@@ -249,24 +291,75 @@ class Encoding:
         return out_buf[:count]
 
     def encode(
-        self, text: str, allowed_special: Union[str, set] = "all"
+        self,
+        text: str,
+        *,
+        allowed_special: Union[Literal["all"], AbstractSet[str]] = set(),
+        disallowed_special: Union[Literal["all"], Collection[str]] = "all",
     ) -> List[int]:
         if not text:
             return []
-        raw = text.encode("utf-8")
-        byte_len = len(raw)
-        max_tokens = max(byte_len, 16)
-        out_buf = (ctypes.c_int32 * max_tokens)()
+
+        if disallowed_special == "all":
+            disallowed = self._special_tokens_set - (self._special_tokens_set if allowed_special == "all" else set(allowed_special))
+            for special in disallowed:
+                if special in text:
+                    raise ValueError(f"Encountered text corresponding to disallowed special token {special!r}.")
+        elif disallowed_special:
+            for special in disallowed_special:
+                if special in text:
+                    raise ValueError(f"Encountered text corresponding to disallowed special token {special!r}.")
 
         if allowed_special == "all":
-            count = self._binding.lib.tiktalkin_encode(
-                self._ctx, raw, byte_len, out_buf, max_tokens
-            )
-        else:
-            count = self._binding.lib.tiktalkin_encode_ordinary(
-                self._ctx, raw, byte_len, out_buf, max_tokens
-            )
-        return out_buf[:count]
+            raw = text.encode("utf-8")
+            byte_len = len(raw)
+            max_tokens = max(byte_len, 16)
+            out_buf = (ctypes.c_int32 * max_tokens)()
+            count = self._binding.lib.tiktalkin_encode(self._ctx, raw, byte_len, out_buf, max_tokens)
+            return out_buf[:count]
+
+        if not allowed_special:
+            return self.encode_ordinary(text)
+
+        allowed_set = set(allowed_special)
+        if allowed_set >= self._special_tokens_set:
+            raw = text.encode("utf-8")
+            byte_len = len(raw)
+            max_tokens = max(byte_len, 16)
+            out_buf = (ctypes.c_int32 * max_tokens)()
+            count = self._binding.lib.tiktalkin_encode(self._ctx, raw, byte_len, out_buf, max_tokens)
+            return out_buf[:count]
+
+        return self.encode_ordinary(text)
+
+    def encode_batch(
+        self,
+        texts: Iterable[str],
+        *,
+        num_threads: int = 8,
+        allowed_special: Union[Literal["all"], AbstractSet[str]] = set(),
+        disallowed_special: Union[Literal["all"], Collection[str]] = "all",
+    ) -> List[List[int]]:
+        text_list = list(texts)
+        if len(text_list) <= 1 or num_threads <= 1:
+            return [self.encode(t, allowed_special=allowed_special, disallowed_special=disallowed_special) for t in text_list]
+        with ThreadPoolExecutor(max_workers=min(num_threads, len(text_list))) as executor:
+            return list(executor.map(
+                lambda t: self.encode(t, allowed_special=allowed_special, disallowed_special=disallowed_special),
+                text_list,
+            ))
+
+    def encode_ordinary_batch(
+        self,
+        texts: Iterable[str],
+        *,
+        num_threads: int = 8,
+    ) -> List[List[int]]:
+        text_list = list(texts)
+        if len(text_list) <= 1 or num_threads <= 1:
+            return [self.encode_ordinary(t) for t in text_list]
+        with ThreadPoolExecutor(max_workers=min(num_threads, len(text_list))) as executor:
+            return list(executor.map(self.encode_ordinary, text_list))
 
     def decode(self, tokens: Sequence[int], errors: str = "replace") -> str:
         if not tokens:
@@ -278,14 +371,34 @@ class Encoding:
         alloc_size = max(count * 8 + 64, 1024)
         buf = ctypes.create_string_buffer(alloc_size)
 
-        written = self._binding.lib.tiktalkin_decode(
+        needed = self._binding.lib.tiktalkin_decode(
             self._ctx, c_tokens, count, buf, alloc_size
         )
-        if written >= alloc_size - 1:
-            alloc_size = count * 32 + 4096
-            buf = ctypes.create_string_buffer(alloc_size)
-            written = self._binding.lib.tiktalkin_decode(
-                self._ctx, c_tokens, count, buf, alloc_size
+        if needed >= alloc_size:
+            buf = ctypes.create_string_buffer(needed + 1)
+            self._binding.lib.tiktalkin_decode(
+                self._ctx, c_tokens, count, buf, needed + 1
             )
 
         return buf.value.decode("utf-8", errors=errors)
+
+    def decode_batch(
+        self,
+        batch: Iterable[Sequence[int]],
+        *,
+        num_threads: int = 8,
+        errors: str = "replace",
+    ) -> List[str]:
+        batch_list = list(batch)
+        if len(batch_list) <= 1 or num_threads <= 1:
+            return [self.decode(toks, errors=errors) for toks in batch_list]
+        with ThreadPoolExecutor(max_workers=min(num_threads, len(batch_list))) as executor:
+            return list(executor.map(lambda toks: self.decode(toks, errors=errors), batch_list))
+
+
+def get_encoding(encoding_name: str = "YuE2", ranks_path: Optional[Union[str, Path]] = None) -> Encoding:
+    return Encoding(name=encoding_name, ranks_path=ranks_path)
+
+
+def encoding_for_model(model_name: str = "YuE2") -> Encoding:
+    return Encoding(name=model_name)

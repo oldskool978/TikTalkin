@@ -32,29 +32,39 @@ int main(int argc, char **argv) {
 #endif
 
     if (argc < 2) {
-        printf("TikTalkin Native Sovereign Tokenizer CLI\n");
+        printf("TikTalkin Native Sovereign Tokenizer CLI (SWISS4 Protocol)\n");
         printf("Usage:\n");
-        printf("  tiktalkin-cli compile <qwen.tiktoken> <qwen.ranks.bin> [telemetry.json]\n");
-        printf("  tiktalkin-cli bench <qwen.ranks.bin> <benchmark_text>\n");
+        printf("  tiktalkin-cli compile <input.tiktoken> <output.ranks.bin> [telemetry.json] [pattern] [specials.json]\n");
+        printf("  tiktalkin-cli bench <ranks.bin> <benchmark_text>\n");
         return 0;
     }
 
     if (strcmp(argv[1], "compile") == 0) {
         if (argc < 4) {
-            fprintf(stderr, "Error: Missing vocabulary input/output arguments.\n");
+            fprintf(stderr, "Error: Missing input/output container paths.\n");
             return 1;
         }
         const char *in_tiktoken = argv[2];
         const char *out_bin = argv[3];
-        const char *out_telem = (argc >= 5) ? argv[4] : NULL;
+        const char *out_telem = (argc >= 5 && argv[4][0] != '\0') ? argv[4] : NULL;
+        const char *pattern = (argc >= 6 && argv[5][0] != '\0') ? argv[5] : NULL;
 
         ttkn_telemetry_t telem;
-        int rc = tiktalkin_compile_vocab_with_telemetry(in_tiktoken, out_bin, out_telem, &telem);
+        int rc = tiktalkin_compile_vocab_v4(
+            in_tiktoken,
+            out_bin,
+            pattern,
+            NULL,
+            0,
+            151643,
+            out_telem,
+            &telem
+        );
         if (rc != 0) {
-            fprintf(stderr, "[!] Serialization error with code: %d\n", rc);
+            fprintf(stderr, "[!] Vocabulary compilation failed with error code: %d\n", rc);
             return 1;
         }
-        printf("[+] Serialization Succeeded:\n");
+        printf("[+] Serialization Succeeded (SWISS4 Container):\n");
         printf("    Tokens:         %u\n", telem.total_tokens);
         printf("    Capacity:       %u (Load: %.2f%%)\n", telem.table_capacity, telem.load_factor * 100.0);
         printf("    SSO Ratio:      %.2f%% (%u inline)\n", telem.sso_ratio * 100.0, telem.sso_tokens);
@@ -66,7 +76,7 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[1], "bench") == 0) {
         if (argc < 4) {
-            fprintf(stderr, "Error: Missing benchmark binary and string arguments.\n");
+            fprintf(stderr, "Error: Missing container binary path and benchmark text argument.\n");
             return 1;
         }
         tiktalkin_ctx_t *ctx = tiktalkin_init(argv[2]);
@@ -87,7 +97,13 @@ int main(int argc, char **argv) {
         uint32_t dec_alloc = in_len * 4 + 1024;
         char *decoded = (char *)malloc(dec_alloc);
         if (decoded) {
-            tiktalkin_decode(ctx, tokens, (uint32_t)count, decoded, dec_alloc);
+            int32_t needed = tiktalkin_decode(ctx, tokens, (uint32_t)count, decoded, dec_alloc);
+            if ((uint32_t)needed >= dec_alloc) {
+                free(decoded);
+                dec_alloc = (uint32_t)needed + 1;
+                decoded = (char *)malloc(dec_alloc);
+                tiktalkin_decode(ctx, tokens, (uint32_t)count, decoded, dec_alloc);
+            }
             printf("[+] Roundtrip Parity: %s\n", (strcmp(test_prompt, decoded) == 0) ? "EXACT MATCH" : "DIVERGENCE DETECTED");
             free(decoded);
         }

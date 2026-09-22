@@ -34,10 +34,14 @@
 #define TTKN_HAS_SSE2 1
 #endif
 
-#define TTKN_MAGIC "TIKTALKIN_SWISS3"
+#define TTKN_MAGIC_V3 "TIKTALKIN_SWISS3"
+#define TTKN_MAGIC_V4 "TIKTALKIN_SWISS4"
 #define TTKN_MAGIC_LEN 16
-#define BASE_VOCAB_SIZE 151643U
-#define TOTAL_VOCAB_SIZE 184704U
+
+#define DEFAULT_BASE_VOCAB_SIZE 151643U
+#define DEFAULT_TOTAL_VOCAB_SIZE 184704U
+#define DEFAULT_EOT_TOKEN_ID 151643U
+
 #define INF_RANK 0xFFFFFFFFU
 #define SSO_MAX_LEN 16U
 #define CTRL_EMPTY 0x80
@@ -57,7 +61,27 @@ typedef struct {
     uint64_t string_data_bytes;
     uint32_t sso_token_count;
     uint8_t  reserved[60];
-} ttkn_header_t;
+} ttkn_header_v3_t;
+
+typedef struct {
+    uint8_t  magic[TTKN_MAGIC_LEN];
+    uint32_t version;
+    uint32_t vocab_size;
+    uint32_t total_vocab_size;
+    uint32_t max_token_len;
+    uint32_t table_capacity;
+    uint32_t sso_token_count;
+    uint64_t ctrl_offset;
+    uint64_t slots_offset;
+    uint64_t string_data_offset;
+    uint64_t string_data_bytes;
+    uint64_t regex_offset;
+    uint32_t regex_bytes;
+    uint32_t specials_count;
+    uint64_t specials_offset;
+    uint32_t eot_token_id;
+    uint8_t  reserved[28];
+} ttkn_header_v4_t;
 
 typedef struct {
     uint64_t hash;
@@ -80,18 +104,30 @@ typedef struct {
     void *mapping_handle;
     uint8_t *base_addr;
     uint64_t total_bytes;
-    const ttkn_header_t *header;
+    uint32_t version;
+    uint32_t vocab_size;
+    uint32_t total_vocab_size;
+    uint32_t table_capacity;
+    uint32_t max_token_len;
+    uint64_t string_data_bytes;
+    uint32_t sso_token_count;
     const uint8_t *ctrl;
     const ttkn_slot_t *slots;
     const uint8_t *string_data;
+    const char *regex_pattern;
+    uint32_t regex_bytes;
+    const ttkn_special_disk_t *specials;
+    uint32_t specials_count;
+    uint32_t eot_token_id;
 } ttkn_mmap_t;
 
 typedef struct {
     pcre2_code *code;
+    uint64_t uid;
 } ttkn_regex_t;
 
 typedef struct {
-    char str[32];
+    char str[64];
     uint32_t len;
     int32_t id;
 } special_entry_t;
@@ -108,9 +144,17 @@ struct tiktalkin_ctx_t {
     uint32_t *id_to_len;
     special_entry_t *specials;
     uint32_t special_count;
+    uint8_t special_prefix_mask[256];
+    uint32_t max_allocated_id;
+    uint32_t base_vocab_size;
+    uint32_t total_vocab_size;
+    uint32_t eot_token_id;
     uint32_t byte_ranks[256];
     uint32_t pair_ranks_2byte[65536];
 };
+
+static const char *DEFAULT_QWEN_PATTERN =
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
 static inline uint32_t ttkn_ctz32(uint32_t mask) {
 #if defined(__GNUC__) || defined(__clang__)
@@ -279,29 +323,78 @@ static int ttkn_mmap_open(ttkn_mmap_t *vm, const char *path) {
     vm->base_addr = base;
 #endif
 
-    if (vm->total_bytes < sizeof(ttkn_header_t)) {
+    if (vm->total_bytes < TTKN_MAGIC_LEN) {
         ttkn_mmap_close(vm);
         return -6;
     }
 
-    vm->header = (const ttkn_header_t *)vm->base_addr;
-    if (memcmp(vm->header->magic, TTKN_MAGIC, TTKN_MAGIC_LEN) != 0) {
-        ttkn_mmap_close(vm);
-        return -7;
+    if (memcmp(vm->base_addr, TTKN_MAGIC_V4, TTKN_MAGIC_LEN) == 0) {
+        if (vm->total_bytes < sizeof(ttkn_header_v4_t)) {
+            ttkn_mmap_close(vm);
+            return -7;
+        }
+        const ttkn_header_v4_t *hdr = (const ttkn_header_v4_t *)vm->base_addr;
+        vm->version = hdr->version;
+        vm->vocab_size = hdr->vocab_size;
+        vm->total_vocab_size = hdr->total_vocab_size;
+        vm->max_token_len = hdr->max_token_len;
+        vm->table_capacity = hdr->table_capacity;
+        vm->sso_token_count = hdr->sso_token_count;
+        vm->string_data_bytes = hdr->string_data_bytes;
+
+        vm->ctrl = (const uint8_t *)(vm->base_addr + hdr->ctrl_offset);
+        vm->slots = (const ttkn_slot_t *)(vm->base_addr + hdr->slots_offset);
+        vm->string_data = (const uint8_t *)(vm->base_addr + hdr->string_data_offset);
+
+        if (hdr->regex_offset > 0 && hdr->regex_bytes > 0) {
+            vm->regex_pattern = (const char *)(vm->base_addr + hdr->regex_offset);
+            vm->regex_bytes = hdr->regex_bytes;
+        }
+
+        if (hdr->specials_offset > 0 && hdr->specials_count > 0) {
+            vm->specials = (const ttkn_special_disk_t *)(vm->base_addr + hdr->specials_offset);
+            vm->specials_count = hdr->specials_count;
+        }
+
+        vm->eot_token_id = hdr->eot_token_id;
+        return 0;
     }
 
-    vm->ctrl = (const uint8_t *)(vm->base_addr + vm->header->ctrl_offset);
-    vm->slots = (const ttkn_slot_t *)(vm->base_addr + vm->header->slots_offset);
-    vm->string_data = (const uint8_t *)(vm->base_addr + vm->header->string_data_offset);
+    if (memcmp(vm->base_addr, TTKN_MAGIC_V3, TTKN_MAGIC_LEN) == 0) {
+        if (vm->total_bytes < sizeof(ttkn_header_v3_t)) {
+            ttkn_mmap_close(vm);
+            return -8;
+        }
+        const ttkn_header_v3_t *hdr = (const ttkn_header_v3_t *)vm->base_addr;
+        vm->version = hdr->version;
+        vm->vocab_size = hdr->vocab_size;
+        vm->total_vocab_size = DEFAULT_TOTAL_VOCAB_SIZE;
+        vm->max_token_len = hdr->max_token_len;
+        vm->table_capacity = hdr->table_capacity;
+        vm->sso_token_count = hdr->sso_token_count;
+        vm->string_data_bytes = hdr->string_data_bytes;
 
-    return 0;
+        vm->ctrl = (const uint8_t *)(vm->base_addr + hdr->ctrl_offset);
+        vm->slots = (const ttkn_slot_t *)(vm->base_addr + hdr->slots_offset);
+        vm->string_data = (const uint8_t *)(vm->base_addr + hdr->string_data_offset);
+
+        vm->regex_pattern = DEFAULT_QWEN_PATTERN;
+        vm->regex_bytes = (uint32_t)strlen(DEFAULT_QWEN_PATTERN) + 1;
+        vm->specials = NULL;
+        vm->specials_count = 0;
+        vm->eot_token_id = DEFAULT_EOT_TOKEN_ID;
+        return 0;
+    }
+
+    ttkn_mmap_close(vm);
+    return -9;
 }
 
 static inline int ttkn_swiss_lookup(const ttkn_mmap_t *vm, const uint8_t *data, uint32_t len, uint32_t *out_rank) {
     if (!vm || !data || len == 0 || !vm->ctrl || !vm->slots) return 0;
 
     uint64_t h = ttkn_hash64(data, len);
-    uint32_t group_count = vm->header->table_capacity / 16;
+    uint32_t group_count = vm->table_capacity / 16;
     uint32_t group_mask = group_count - 1;
     uint32_t group = (uint32_t)((h >> 7) & group_mask);
     uint8_t h2 = (uint8_t)(h & 0x7F);
@@ -450,9 +543,50 @@ static int flush_and_commit_file(FILE *f) {
     return 0;
 }
 
-int32_t tiktalkin_compile_vocab_with_telemetry(
+static uint32_t populate_default_qwen_specials(ttkn_special_disk_t *out_specials) {
+    uint32_t n = 0;
+
+    #define EMIT_SPEC(text, tid) do { \
+        if (out_specials) { \
+            out_specials[n].id = (int32_t)(tid); \
+            strncpy(out_specials[n].literal, (text), 57); \
+            out_specials[n].literal[57] = '\0'; \
+            out_specials[n].length = (uint16_t)strlen(out_specials[n].literal); \
+        } \
+        n++; \
+    } while (0)
+
+    EMIT_SPEC("<|endoftext|>", 151643);
+    EMIT_SPEC("<|im_start|>",   151644);
+    EMIT_SPEC("<|im_end|>",     151645);
+    EMIT_SPEC("<R>",            151646);
+    EMIT_SPEC("<S>",            151647);
+    EMIT_SPEC("<X>",            151648);
+    EMIT_SPEC("<mask>",         151649);
+    EMIT_SPEC("<sep>",          151650);
+
+    for (int i = 0; i < 196; i++) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "<extra_%d>", i);
+        EMIT_SPEC(buf, 151651 + i);
+    }
+
+    EMIT_SPEC("<abc>",          151847);
+    EMIT_SPEC("</abc>",         151848);
+    EMIT_SPEC("<extra_198>",    151849);
+    EMIT_SPEC("<extra_199>",    151850);
+    #undef EMIT_SPEC
+
+    return n;
+}
+
+int32_t tiktalkin_compile_vocab_v4(
     const char *in_tiktoken_path,
     const char *out_bin_path,
+    const char *regex_pattern,
+    const ttkn_special_disk_t *specials,
+    uint32_t specials_count,
+    uint32_t eot_token_id,
     const char *out_telemetry_json,
     ttkn_telemetry_t *out_telemetry
 ) {
@@ -617,21 +751,57 @@ int32_t tiktalkin_compile_vocab_with_telemetry(
     double probe_var = count > 0 ? (var_accum / (double)count) : 0.0;
     free(item_probes);
 
-    uint64_t header_padded_bytes = (sizeof(ttkn_header_t) + 63ULL) & ~63ULL;
-    uint64_t slots_padded_bytes = ((uint64_t)table_capacity * sizeof(ttkn_slot_t) + 63ULL) & ~63ULL;
+    const char *chosen_regex = (regex_pattern && regex_pattern[0] != '\0') ? regex_pattern : DEFAULT_QWEN_PATTERN;
+    uint32_t regex_raw_len = (uint32_t)strlen(chosen_regex) + 1;
 
-    ttkn_header_t hdr;
+    ttkn_special_disk_t *local_specials = NULL;
+    uint32_t effective_specials_count = specials_count;
+
+    if (!specials || specials_count == 0) {
+        local_specials = (ttkn_special_disk_t *)malloc(sizeof(ttkn_special_disk_t) * 256);
+        effective_specials_count = populate_default_qwen_specials(local_specials);
+    } else {
+        local_specials = (ttkn_special_disk_t *)malloc(sizeof(ttkn_special_disk_t) * specials_count);
+        memcpy(local_specials, specials, sizeof(ttkn_special_disk_t) * specials_count);
+    }
+
+    uint32_t max_seen_id = count;
+    for (uint32_t i = 0; i < effective_specials_count; i++) {
+        if ((uint32_t)local_specials[i].id > max_seen_id) {
+            max_seen_id = (uint32_t)local_specials[i].id;
+        }
+    }
+    uint32_t total_vocab_calc = max_seen_id + 1;
+    if (total_vocab_calc < DEFAULT_TOTAL_VOCAB_SIZE) {
+        total_vocab_calc = DEFAULT_TOTAL_VOCAB_SIZE;
+    }
+
+    uint64_t header_padded_bytes = (sizeof(ttkn_header_v4_t) + 63ULL) & ~63ULL;
+    uint64_t slots_padded_bytes = ((uint64_t)table_capacity * sizeof(ttkn_slot_t) + 63ULL) & ~63ULL;
+    uint64_t string_padded_bytes = (total_heap_str_bytes + 63ULL) & ~63ULL;
+    uint64_t regex_padded_bytes = ((uint64_t)regex_raw_len + 63ULL) & ~63ULL;
+    uint64_t specials_raw_bytes = (uint64_t)effective_specials_count * sizeof(ttkn_special_disk_t);
+    uint64_t specials_padded_bytes = (specials_raw_bytes + 63ULL) & ~63ULL;
+
+    ttkn_header_v4_t hdr;
     memset(&hdr, 0, sizeof(hdr));
-    memcpy(hdr.magic, TTKN_MAGIC, TTKN_MAGIC_LEN);
-    hdr.version = 3;
+    memcpy(hdr.magic, TTKN_MAGIC_V4, TTKN_MAGIC_LEN);
+    hdr.version = 4;
     hdr.vocab_size = count;
+    hdr.total_vocab_size = total_vocab_calc;
     hdr.max_token_len = max_len;
     hdr.table_capacity = table_capacity;
+    hdr.sso_token_count = sso_count;
+
     hdr.ctrl_offset = header_padded_bytes;
     hdr.slots_offset = hdr.ctrl_offset + ctrl_padded_bytes;
     hdr.string_data_offset = hdr.slots_offset + slots_padded_bytes;
     hdr.string_data_bytes = total_heap_str_bytes;
-    hdr.sso_token_count = sso_count;
+    hdr.regex_offset = hdr.string_data_offset + string_padded_bytes;
+    hdr.regex_bytes = regex_raw_len;
+    hdr.specials_offset = hdr.regex_offset + regex_padded_bytes;
+    hdr.specials_count = effective_specials_count;
+    hdr.eot_token_id = (eot_token_id > 0) ? eot_token_id : DEFAULT_EOT_TOKEN_ID;
 
     char tmp_bin_path[1024];
     snprintf(tmp_bin_path, sizeof(tmp_bin_path), "%s.tmp", out_bin_path);
@@ -641,6 +811,7 @@ int32_t tiktalkin_compile_vocab_with_telemetry(
         free(ctrl);
         free(slots);
         if (str_blob) free(str_blob);
+        free(local_specials);
         return -4;
     }
 
@@ -661,6 +832,20 @@ int32_t tiktalkin_compile_vocab_with_telemetry(
     if (total_heap_str_bytes > 0 && str_blob) {
         fwrite(str_blob, 1, (size_t)total_heap_str_bytes, f_out);
     }
+    if (string_padded_bytes > total_heap_str_bytes) {
+        fwrite(zero_pad, 1, (size_t)(string_padded_bytes - total_heap_str_bytes), f_out);
+    }
+
+    fwrite(chosen_regex, 1, regex_raw_len, f_out);
+    if (regex_padded_bytes > regex_raw_len) {
+        fwrite(zero_pad, 1, (size_t)(regex_padded_bytes - regex_raw_len), f_out);
+    }
+
+    fwrite(local_specials, sizeof(ttkn_special_disk_t), effective_specials_count, f_out);
+    if (specials_padded_bytes > specials_raw_bytes) {
+        fwrite(zero_pad, 1, (size_t)(specials_padded_bytes - specials_raw_bytes), f_out);
+    }
+
     flush_and_commit_file(f_out);
     fclose(f_out);
 
@@ -675,6 +860,7 @@ int32_t tiktalkin_compile_vocab_with_telemetry(
     free(ctrl);
     free(slots);
     if (str_blob) free(str_blob);
+    free(local_specials);
 
     clock_t t1 = clock();
     double elapsed_sec = (double)(t1 - t0) / CLOCKS_PER_SEC;
@@ -728,14 +914,41 @@ int32_t tiktalkin_compile_vocab_with_telemetry(
     return 0;
 }
 
+int32_t tiktalkin_compile_vocab_with_telemetry(
+    const char *in_tiktoken_path,
+    const char *out_bin_path,
+    const char *out_telemetry_json,
+    ttkn_telemetry_t *out_telemetry
+) {
+    return tiktalkin_compile_vocab_v4(
+        in_tiktoken_path,
+        out_bin_path,
+        NULL,
+        NULL,
+        0,
+        DEFAULT_EOT_TOKEN_ID,
+        out_telemetry_json,
+        out_telemetry
+    );
+}
+
 int32_t tiktalkin_compile_vocab(const char *in_tiktoken_path, const char *out_bin_path) {
     return tiktalkin_compile_vocab_with_telemetry(in_tiktoken_path, out_bin_path, NULL, NULL);
 }
 
-static const char *QWEN_PATTERN =
-    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+#if defined(_WIN32)
+static inline uint64_t next_regex_uid(void) {
+    static volatile LONG64 seq = 1;
+    return (uint64_t)InterlockedIncrement64(&seq);
+}
+#else
+static inline uint64_t next_regex_uid(void) {
+    static volatile uint64_t seq = 1;
+    return __sync_add_and_fetch(&seq, 1);
+}
+#endif
 
-static ttkn_regex_t *ttkn_regex_init(void) {
+static ttkn_regex_t *ttkn_regex_init(const char *pattern) {
     ttkn_regex_t *re = (ttkn_regex_t *)malloc(sizeof(ttkn_regex_t));
     if (!re) return NULL;
 
@@ -743,8 +956,10 @@ static ttkn_regex_t *ttkn_regex_init(void) {
     PCRE2_SIZE erroffset = 0;
     uint32_t options = PCRE2_UTF | PCRE2_UCP;
 
+    const char *actual_pat = (pattern && pattern[0] != '\0') ? pattern : DEFAULT_QWEN_PATTERN;
+
     re->code = pcre2_compile(
-        (PCRE2_SPTR)QWEN_PATTERN,
+        (PCRE2_SPTR)actual_pat,
         PCRE2_ZERO_TERMINATED,
         options,
         &errcode,
@@ -757,6 +972,7 @@ static ttkn_regex_t *ttkn_regex_init(void) {
     }
 
     pcre2_jit_compile(re->code, PCRE2_JIT_COMPLETE);
+    re->uid = next_regex_uid();
     return re;
 }
 
@@ -766,14 +982,19 @@ static void ttkn_regex_destroy(ttkn_regex_t *re) {
     free(re);
 }
 
-static inline pcre2_match_data *get_tls_match_data(pcre2_code *code) {
+static inline pcre2_match_data *get_tls_match_data(const ttkn_regex_t *re) {
 #if defined(_MSC_VER)
     static __declspec(thread) pcre2_match_data *tls_md = NULL;
+    static __declspec(thread) uint64_t tls_last_uid = 0;
 #else
     static __thread pcre2_match_data *tls_md = NULL;
+    static __thread uint64_t tls_last_uid = 0;
 #endif
-    if (!tls_md && code) {
-        tls_md = pcre2_match_data_create_from_pattern(code, NULL);
+    if (!re || !re->code) return NULL;
+    if (!tls_md || tls_last_uid != re->uid) {
+        if (tls_md) pcre2_match_data_free(tls_md);
+        tls_md = pcre2_match_data_create_from_pattern(re->code, NULL);
+        tls_last_uid = re->uid;
     }
     return tls_md;
 }
@@ -990,7 +1211,8 @@ static inline int32_t ttkn_bpe_dynamic_heap(
     uint32_t max_out
 ) {
     bpe_node_t *nodes = (bpe_node_t *)malloc(sizeof(bpe_node_t) * len);
-    heap_item_t *heap = (heap_item_t *)malloc(sizeof(heap_item_t) * len * 4);
+    uint32_t heap_cap = len * 4;
+    heap_item_t *heap = (heap_item_t *)malloc(sizeof(heap_item_t) * heap_cap);
     if (!nodes || !heap) {
         if (nodes) free(nodes);
         if (heap) free(heap);
@@ -1126,43 +1348,6 @@ static int compare_specials_desc(const void *a, const void *b) {
     return 0;
 }
 
-static void build_special_table(tiktalkin_ctx_t *ctx) {
-    ctx->specials = (special_entry_t *)malloc(sizeof(special_entry_t) * 256);
-    uint32_t n = 0;
-
-    #define ADD_SPEC(text, tid) do { \
-        strncpy(ctx->specials[n].str, (text), 31); \
-        ctx->specials[n].str[31] = '\0'; \
-        ctx->specials[n].len = (uint32_t)strlen(ctx->specials[n].str); \
-        ctx->specials[n].id = (int32_t)(tid); \
-        n++; \
-    } while(0)
-
-    ADD_SPEC("<|endoftext|>", 151643);
-    ADD_SPEC("<|im_start|>",   151644);
-    ADD_SPEC("<|im_end|>",     151645);
-    ADD_SPEC("<R>",            151646);
-    ADD_SPEC("<S>",            151647);
-    ADD_SPEC("<X>",            151648);
-    ADD_SPEC("<mask|",         151649);
-    ADD_SPEC("<sep>",          151650);
-
-    for (int i = 0; i < 196; i++) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "<extra_%d>", i);
-        ADD_SPEC(buf, 151651 + i);
-    }
-
-    ADD_SPEC("<abc>",          151847);
-    ADD_SPEC("</abc>",         151848);
-    ADD_SPEC("<extra_198>",    151849);
-    ADD_SPEC("<extra_199>",    151850);
-    #undef ADD_SPEC
-
-    ctx->special_count = n;
-    qsort(ctx->specials, ctx->special_count, sizeof(special_entry_t), compare_specials_desc);
-}
-
 static void segment_bpe_callback(const uint8_t *piece, uint32_t len, void *user_data) {
     encode_state_t *st = (encode_state_t *)user_data;
     if (st->count >= st->max_tokens) return;
@@ -1203,22 +1388,69 @@ TTKN_API tiktalkin_ctx_t *tiktalkin_init(const char *ranks_bin_path) {
         return NULL;
     }
 
-    ctx->regex = ttkn_regex_init();
+    ctx->base_vocab_size = ctx->vm.vocab_size;
+    ctx->total_vocab_size = ctx->vm.total_vocab_size;
+    ctx->eot_token_id = ctx->vm.eot_token_id;
+
+    ctx->regex = ttkn_regex_init(ctx->vm.regex_pattern);
     if (!ctx->regex) {
         ttkn_mmap_close(&ctx->vm);
         free(ctx);
         return NULL;
     }
 
-    ctx->id_to_str = (char **)calloc(TOTAL_VOCAB_SIZE, sizeof(char *));
-    ctx->id_to_len = (uint32_t *)calloc(TOTAL_VOCAB_SIZE, sizeof(uint32_t));
+    uint32_t max_id_tracker = ctx->total_vocab_size;
+
+    if (ctx->vm.specials && ctx->vm.specials_count > 0) {
+        ctx->specials = (special_entry_t *)malloc(sizeof(special_entry_t) * ctx->vm.specials_count);
+        ctx->special_count = ctx->vm.specials_count;
+        for (uint32_t i = 0; i < ctx->vm.specials_count; i++) {
+            strncpy(ctx->specials[i].str, ctx->vm.specials[i].literal, 63);
+            ctx->specials[i].str[63] = '\0';
+            ctx->specials[i].len = (uint32_t)strlen(ctx->specials[i].str);
+            ctx->specials[i].id = ctx->vm.specials[i].id;
+            if ((uint32_t)ctx->specials[i].id > max_id_tracker) {
+                max_id_tracker = (uint32_t)ctx->specials[i].id;
+            }
+        }
+        qsort(ctx->specials, ctx->special_count, sizeof(special_entry_t), compare_specials_desc);
+    } else {
+        ttkn_special_disk_t *defaults = (ttkn_special_disk_t *)malloc(sizeof(ttkn_special_disk_t) * 256);
+        uint32_t def_count = populate_default_qwen_specials(defaults);
+
+        ctx->specials = (special_entry_t *)malloc(sizeof(special_entry_t) * def_count);
+        ctx->special_count = def_count;
+        for (uint32_t i = 0; i < def_count; i++) {
+            strncpy(ctx->specials[i].str, defaults[i].literal, 63);
+            ctx->specials[i].str[63] = '\0';
+            ctx->specials[i].len = defaults[i].length;
+            ctx->specials[i].id = defaults[i].id;
+            if ((uint32_t)defaults[i].id > max_id_tracker) {
+                max_id_tracker = (uint32_t)defaults[i].id;
+            }
+        }
+        free(defaults);
+        qsort(ctx->specials, ctx->special_count, sizeof(special_entry_t), compare_specials_desc);
+    }
+
+    memset(ctx->special_prefix_mask, 0, 256);
+    for (uint32_t i = 0; i < ctx->special_count; i++) {
+        if (ctx->specials[i].len > 0) {
+            uint8_t c = (uint8_t)ctx->specials[i].str[0];
+            ctx->special_prefix_mask[c] = 1;
+        }
+    }
+
+    ctx->max_allocated_id = max_id_tracker + 1;
+    ctx->id_to_str = (char **)calloc(ctx->max_allocated_id, sizeof(char *));
+    ctx->id_to_len = (uint32_t *)calloc(ctx->max_allocated_id, sizeof(uint32_t));
 
     const ttkn_slot_t *slots = ctx->vm.slots;
     const uint8_t *ctrl = ctx->vm.ctrl;
-    uint32_t cap = ctx->vm.header->table_capacity;
+    uint32_t cap = ctx->vm.table_capacity;
 
     for (uint32_t i = 0; i < cap; i++) {
-        if (ctrl[i] != CTRL_EMPTY && ctrl[i] != CTRL_SENTINEL && slots[i].rank < BASE_VOCAB_SIZE) {
+        if (ctrl[i] != CTRL_EMPTY && ctrl[i] != CTRL_SENTINEL && slots[i].rank < ctx->max_allocated_id) {
             uint32_t r = slots[i].rank;
             if (slots[i].is_inline) {
                 ctx->id_to_str[r] = (char *)slots[i].storage.inline_bytes;
@@ -1229,10 +1461,9 @@ TTKN_API tiktalkin_ctx_t *tiktalkin_init(const char *ranks_bin_path) {
         }
     }
 
-    build_special_table(ctx);
     for (uint32_t i = 0; i < ctx->special_count; i++) {
         int32_t sid = ctx->specials[i].id;
-        if (sid >= 0 && (uint32_t)sid < TOTAL_VOCAB_SIZE) {
+        if (sid >= 0 && (uint32_t)sid < ctx->max_allocated_id) {
             ctx->id_to_str[sid] = ctx->specials[i].str;
             ctx->id_to_len[sid] = ctx->specials[i].len;
         }
@@ -1273,7 +1504,7 @@ TTKN_API int32_t tiktalkin_encode(
 ) {
     if (!ctx || !text || text_bytes == 0 || !out_token_ids || max_tokens == 0) return 0;
 
-    pcre2_match_data *match_data = get_tls_match_data(ctx->regex->code);
+    pcre2_match_data *match_data = get_tls_match_data(ctx->regex);
     if (!match_data) return 0;
 
     encode_state_t st = {
@@ -1287,7 +1518,8 @@ TTKN_API int32_t tiktalkin_encode(
     uint32_t segment_start = 0;
 
     while (cursor < text_bytes && st.count < max_tokens) {
-        if (text[cursor] == '<') {
+        uint8_t c = (uint8_t)text[cursor];
+        if (ctx->special_prefix_mask[c]) {
             int32_t sp_id = 0;
             uint32_t sp_len = 0;
             if (check_special_token(ctx, text + cursor, text_bytes - cursor, &sp_id, &sp_len)) {
@@ -1335,7 +1567,7 @@ TTKN_API int32_t tiktalkin_encode_ordinary(
 ) {
     if (!ctx || !text || text_bytes == 0 || !out_token_ids || max_tokens == 0) return 0;
 
-    pcre2_match_data *match_data = get_tls_match_data(ctx->regex->code);
+    pcre2_match_data *match_data = get_tls_match_data(ctx->regex);
     if (!match_data) return 0;
 
     encode_state_t st = {
@@ -1364,23 +1596,36 @@ TTKN_API int32_t tiktalkin_decode(
     char *out_text,
     uint32_t max_bytes
 ) {
-    if (!ctx || !token_ids || id_count == 0 || !out_text || max_bytes == 0) return 0;
+    if (!ctx || !token_ids || id_count == 0) return 0;
 
+    uint32_t total_needed = 0;
     uint32_t written = 0;
+    bool truncated = false;
+
     for (uint32_t i = 0; i < id_count; i++) {
         int32_t id = token_ids[i];
-        if (id >= 0 && (uint32_t)id < TOTAL_VOCAB_SIZE) {
+        if (id >= 0 && (uint32_t)id < ctx->max_allocated_id) {
             uint32_t len = ctx->id_to_len[id];
             const char *s = ctx->id_to_str[id];
             if (s && len > 0) {
-                if (written + len >= max_bytes) break;
-                memcpy(out_text + written, s, len);
-                written += len;
+                if (out_text && max_bytes > 0 && !truncated) {
+                    if (written + len < max_bytes) {
+                        memcpy(out_text + written, s, len);
+                        written += len;
+                    } else {
+                        truncated = true;
+                    }
+                }
+                total_needed += len;
             }
         }
     }
-    out_text[written] = '\0';
-    return (int32_t)written;
+
+    if (out_text && max_bytes > 0) {
+        out_text[written] = '\0';
+    }
+
+    return (int32_t)total_needed;
 }
 
 TTKN_API void tiktalkin_destroy(tiktalkin_ctx_t *ctx) {
