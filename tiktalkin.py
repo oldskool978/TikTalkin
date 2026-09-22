@@ -5,7 +5,17 @@ import ctypes
 import os
 from pathlib import Path
 import sys
-from typing import Collection, Iterable, List, Optional, Sequence, Set, Union
+from typing import (
+    AbstractSet,
+    Collection,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Set,
+    Union,
+)
 
 ROOT_DIR = Path(__file__).resolve().parent
 IS_WIN = sys.platform == "win32"
@@ -376,11 +386,11 @@ class Encoding:
         )
         if needed >= alloc_size:
             buf = ctypes.create_string_buffer(needed + 1)
-            self._binding.lib.tiktalkin_decode(
+            needed = self._binding.lib.tiktalkin_decode(
                 self._ctx, c_tokens, count, buf, needed + 1
             )
 
-        return buf.value.decode("utf-8", errors=errors)
+        return buf.raw[:needed].decode("utf-8", errors=errors)
 
     def decode_batch(
         self,
