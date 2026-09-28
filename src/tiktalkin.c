@@ -562,7 +562,7 @@ static uint32_t populate_default_qwen_specials(ttkn_special_disk_t *out_specials
     EMIT_SPEC("<R>",            151646);
     EMIT_SPEC("<S>",            151647);
     EMIT_SPEC("<X>",            151648);
-    EMIT_SPEC("<mask>",         151649);
+    EMIT_SPEC("<mask >",        151649);
     EMIT_SPEC("<sep>",          151650);
 
     for (int i = 0; i < 196; i++) {
@@ -575,6 +575,12 @@ static uint32_t populate_default_qwen_specials(ttkn_special_disk_t *out_specials
     EMIT_SPEC("</abc>",         151848);
     EMIT_SPEC("<extra_198>",    151849);
     EMIT_SPEC("<extra_199>",    151850);
+    EMIT_SPEC("<music_start>",  151851);
+    EMIT_SPEC("<music_end>",    151852);
+    EMIT_SPEC("<latent_start>", 184621);
+    EMIT_SPEC("<latent_end>",   184622);
+    EMIT_SPEC("<latent_pad>",   184623);
+
     #undef EMIT_SPEC
 
     return n;
@@ -758,7 +764,7 @@ int32_t tiktalkin_compile_vocab_v4(
     uint32_t effective_specials_count = specials_count;
 
     if (!specials || specials_count == 0) {
-        local_specials = (ttkn_special_disk_t *)malloc(sizeof(ttkn_special_disk_t) * 256);
+        local_specials = (ttkn_special_disk_t *)malloc(sizeof(ttkn_special_disk_t) * 512);
         effective_specials_count = populate_default_qwen_specials(local_specials);
     } else {
         local_specials = (ttkn_special_disk_t *)malloc(sizeof(ttkn_special_disk_t) * specials_count);
@@ -1379,6 +1385,38 @@ static inline int check_special_token(
     return 0;
 }
 
+TTKN_API uint32_t tiktalkin_find_common_prefix(
+    const int32_t *tokens_a,
+    uint32_t len_a,
+    const int32_t *tokens_b,
+    uint32_t len_b
+) {
+    if (!tokens_a || !tokens_b) return 0;
+    uint32_t limit = (len_a < len_b) ? len_a : len_b;
+    uint32_t i = 0;
+
+#if defined(TTKN_HAS_SSE2)
+    while (i + 4 <= limit) {
+        __m128i va = _mm_loadu_si128((const __m128i *)(tokens_a + i));
+        __m128i vb = _mm_loadu_si128((const __m128i *)(tokens_b + i));
+        __m128i eq = _mm_cmpeq_epi32(va, vb);
+        int mask = _mm_movemask_epi8(eq) & 0xFFFF;
+        if (mask != 0xFFFF) {
+            break;
+        }
+        i += 4;
+    }
+#endif
+
+    while (i < limit) {
+        if (tokens_a[i] != tokens_b[i]) {
+            return i;
+        }
+        i++;
+    }
+    return limit;
+}
+
 TTKN_API tiktalkin_ctx_t *tiktalkin_init(const char *ranks_bin_path) {
     tiktalkin_ctx_t *ctx = (tiktalkin_ctx_t *)calloc(1, sizeof(tiktalkin_ctx_t));
     if (!ctx) return NULL;
@@ -1415,7 +1453,7 @@ TTKN_API tiktalkin_ctx_t *tiktalkin_init(const char *ranks_bin_path) {
         }
         qsort(ctx->specials, ctx->special_count, sizeof(special_entry_t), compare_specials_desc);
     } else {
-        ttkn_special_disk_t *defaults = (ttkn_special_disk_t *)malloc(sizeof(ttkn_special_disk_t) * 256);
+        ttkn_special_disk_t *defaults = (ttkn_special_disk_t *)malloc(sizeof(ttkn_special_disk_t) * 512);
         uint32_t def_count = populate_default_qwen_specials(defaults);
 
         ctx->specials = (special_entry_t *)malloc(sizeof(special_entry_t) * def_count);

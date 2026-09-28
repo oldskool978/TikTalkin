@@ -67,6 +67,13 @@ TTKN_API int32_t tiktalkin_decode(
     uint32_t max_bytes
 );
 
+TTKN_API uint32_t tiktalkin_find_common_prefix(
+    const int32_t *tokens_a,
+    uint32_t len_a,
+    const int32_t *tokens_b,
+    uint32_t len_b
+);
+
 TTKN_API int32_t tiktalkin_compile_vocab_with_telemetry(
     const char *in_tiktoken_path,
     const char *out_bin_path,

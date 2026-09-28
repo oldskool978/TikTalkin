@@ -75,6 +75,31 @@ def resolve_vocab_file() -> Path:
     raise FileNotFoundError("Could not locate qwen.tiktoken.")
 
 
+def get_yue2_special_tokens_dict() -> dict[str, int]:
+    specials_dict = {
+        "<|endoftext|>": 151643,
+        "<|im_start|>": 151644,
+        "<|im_end|>": 151645,
+        "<R>": 151646,
+        "<S>": 151647,
+        "<X>": 151648,
+        "<mask >": 151649,
+        "<sep>": 151650,
+    }
+    for i in range(196):
+        specials_dict[f"<extra_{i}>"] = 151651 + i
+    specials_dict["<abc>"] = 151847
+    specials_dict["</abc>"] = 151848
+    specials_dict["<extra_198>"] = 151849
+    specials_dict["<extra_199>"] = 151850
+    specials_dict["<music_start>"] = 151851
+    specials_dict["<music_end>"] = 151852
+    specials_dict["<latent_start>"] = 184621
+    specials_dict["<latent_end>"] = 184622
+    specials_dict["<latent_pad>"] = 184623
+    return specials_dict
+
+
 def benchmark_cold_start(vocab_path: Path) -> None:
     print("\n--- Cold-Start Initialization Latency ---")
     t0 = time.perf_counter()
@@ -82,16 +107,12 @@ def benchmark_cold_start(vocab_path: Path) -> None:
         base64.b64decode(t): int(r)
         for t, r in (line.split() for line in vocab_path.read_bytes().splitlines() if line)
     }
-    specials = [
-        "<|endoftext|>", "<|im_start|>", "<|im_end|>", "<R>", "<S>", "<X>", "<mask|>", "<sep>"
-    ]
-    specials += [f"<extra_{i}>" for i in range(200)]
-    specials[204:206] = ["<abc>", "</abc>"]
+    specials_dict = get_yue2_special_tokens_dict()
     pattern = (
         r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|"
         r" ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
     )
-    _ = tiktoken.Encoding("YuE2", pat_str=pattern, mergeable_ranks=ranks, special_tokens={s: i + len(ranks) for i, s in enumerate(specials)})
+    _ = tiktoken.Encoding("YuE2", pat_str=pattern, mergeable_ranks=ranks, special_tokens=specials_dict)
     t_ref_cold = (time.perf_counter() - t0) * 1000.0
 
     t0 = time.perf_counter()
@@ -115,17 +136,13 @@ def run_benchmarks(iters: int = 50) -> None:
         base64.b64decode(t): int(r)
         for t, r in (line.split() for line in vocab_path.read_bytes().splitlines() if line)
     }
-    specials = [
-        "<|endoftext|>", "<|im_start|>", "<|im_end|>", "<R>", "<S>", "<X>", "<mask|>", "<sep>"
-    ]
-    specials += [f"<extra_{i}>" for i in range(200)]
-    specials[204:206] = ["<abc>", "</abc>"]
+    specials_dict = get_yue2_special_tokens_dict()
     pattern = (
         r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|"
         r" ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
     )
 
-    ref = tiktoken.Encoding("YuE2", pat_str=pattern, mergeable_ranks=ranks, special_tokens={s: i + len(ranks) for i, s in enumerate(specials)})
+    ref = tiktoken.Encoding("YuE2", pat_str=pattern, mergeable_ranks=ranks, special_tokens=specials_dict)
     sov = tiktalkin.Encoding("YuE2", ranks_path=RANKS_BIN)
 
     for name, text in CORPUS:
@@ -136,7 +153,6 @@ def run_benchmarks(iters: int = 50) -> None:
         sov_out = sov.encode_ordinary(normalized)
         assert ref_out == sov_out, f"Differential mismatch on {name}"
 
-        # Warmup cache
         for _ in range(10):
             ref.encode_ordinary(normalized)
             sov.encode_ordinary(normalized)

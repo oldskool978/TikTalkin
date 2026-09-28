@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import base64
 import gc
 import json
@@ -69,6 +71,7 @@ def get_process_memory_mb() -> float:
         import resource
         return float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1024.0
 
+
 def resolve_vocab_file() -> Path:
     candidates = [
         ROOT_DIR / "qwen.tiktoken",
@@ -109,7 +112,7 @@ def run_differential_matrix(ref_enc: tiktoken.Encoding, sov_enc: tiktalkin.Encod
         ("SMP Musical Glyphs", "𝄞 𝄢 𝄡 𝅘 𝅥 𝅦"),
         ("Quad-Byte SMP Emojis", "🚀🔥🎧🎼🎹🎺🎻" * 4),
         ("ChatML Standard Structure", "<|im_start|>system\nYou are an authoritative music engine.<|im_end|><|im_start|>user\nCompose.<|im_end|>"),
-        ("Sequential Control Delimiters", "<|endoftext|><abc></abc><extra_0><extra_199><mask><sep>"),
+        ("Sequential Control Delimiters", "<|endoftext|><abc></abc><extra_0><extra_199><mask ><sep>"),
         ("Unclosed Delimiter Traps", "Prefix traps: <|im_start, <abc, <<abc>>, <invalid_tag>, <extra_999>, 3 < 5, 10 > 2."),
         ("Stress Compound Block", "Supercalifragilisticexpialidocious" * 16),
         ("Single Character Slices", "A"),
@@ -137,6 +140,94 @@ def run_differential_matrix(ref_enc: tiktoken.Encoding, sov_enc: tiktalkin.Encod
             sys.exit(1)
 
         print(f"  Vector [{idx:02d}]: PASSED (Bit-Exact) | {label:<36} ({len(sov_tokens):4d} tokens)")
+
+
+def run_special_token_edgecases(ref_enc: tiktoken.Encoding, sov_enc: tiktalkin.Encoding) -> None:
+    print("\n--- Running Special Token Edge-Case & Subset Verification ---")
+
+    assert "<mask >" in sov_enc.special_tokens_set, "Assertion Error: '<mask >' missing from special_tokens_set"
+    assert "<mask|>" not in sov_enc.special_tokens_set, "Assertion Error: Outdated '<mask|>' typo still present"
+    assert "<music_start>" in sov_enc.special_tokens_set, "Assertion Error: '<music_start>' missing"
+    assert "<music_end>" in sov_enc.special_tokens_set, "Assertion Error: '<music_end>' missing"
+
+    try:
+        ref_enc.encode("This should fail: <|endoftext|>", disallowed_special="all")
+        raise AssertionError("ref_enc failed to raise ValueError")
+    except ValueError:
+        pass
+
+    try:
+        sov_enc.encode("This should fail: <|endoftext|>", disallowed_special="all")
+        raise AssertionError("sov_enc failed to raise ValueError")
+    except ValueError:
+        print("  [+] Disallowed token rejection: PASSED (ValueError raised identically to tiktoken)")
+
+    test_text = "Instruction: generate score <abc>X:1|C4</abc> with <|endoftext|> delimiter."
+    allowed_subsets = [
+        {"<abc>", "</abc>"},
+        {"<|endoftext|>"},
+        {"<abc>", "</abc>", "<|endoftext|>"},
+    ]
+
+    for subset in allowed_subsets:
+        ref_out = ref_enc.encode(test_text, allowed_special=subset, disallowed_special=())
+        sov_out = sov_enc.encode(test_text, allowed_special=subset, disallowed_special=())
+        assert ref_out == sov_out, f"Subset mismatch on allowed_special={subset}: {ref_out} != {sov_out}"
+        print(f"  [+] Subset verification: PASSED (Bit-Exact match for {subset})")
+
+    adjacent_test = "<abc><|endoftext|></abc>"
+    ref_adj = ref_enc.encode(adjacent_test, allowed_special={"<abc>", "</abc>"}, disallowed_special=())
+    sov_adj = sov_enc.encode(adjacent_test, allowed_special={"<abc>", "</abc>"}, disallowed_special=())
+    assert ref_adj == sov_adj, f"Adjacent special mismatch: {ref_adj} != {sov_adj}"
+    assert 151643 not in sov_adj, "<|endoftext|> was wrongly tokenized as special ID 151643"
+    print("  [+] Adjacent unallowed special treated as ordinary text: PASSED (Bit-Exact)")
+
+
+def run_agentic_prefix_splicing_audit(sov_enc: tiktalkin.Encoding) -> None:
+    print("\n--- Running Agentic Prefix Splicing Audit ---")
+    
+    a1 = [10, 20, 30, 40, 50]
+    b1 = [10, 20, 30, 40, 50]
+    assert tiktalkin.find_common_prefix(a1, b1) == 5, "Identical sequence prefix mismatch"
+
+    a2 = [10, 20, 30, 40, 50]
+    b2 = [10, 20, 30, 99, 50]
+    assert tiktalkin.find_common_prefix(a2, b2) == 3, "Divergence calculation failure"
+
+    assert tiktalkin.find_common_prefix([], [1, 2, 3]) == 0, "Empty sequence boundary failure"
+
+    orig_abc = "X:1\nM:4/4\nL:1/8\nK:C\n|: CDEF GABc | [CEG]4 c4 :|"
+    edit_abc = "X:1\nM:4/4\nL:1/8\nK:C\n|: CDEF GABc | [CFA]4 c4 :|"
+    
+    t_orig = sov_enc.encode_ordinary(orig_abc)
+    t_edit = sov_enc.encode_ordinary(edit_abc)
+    split_pt = tiktalkin.find_common_prefix(t_orig, t_edit)
+    
+    assert 0 < split_pt < len(t_orig), "ABC mutation split point out of range"
+    assert t_orig[:split_pt] == t_edit[:split_pt], "Common prefix content mismatch"
+    assert t_orig[split_pt] != t_edit[split_pt], "Common prefix divergence failure"
+    
+    saved_ratio = (split_pt / float(len(t_orig))) * 100.0
+    print(f"  [+] Realistic score mutation: PASSED ({split_pt}/{len(t_orig)} tokens retained, {saved_ratio:.1f}% KV-cache reuse)")
+
+
+def run_batch_pipeline_audit(ref_enc: tiktoken.Encoding, sov_enc: tiktalkin.Encoding) -> None:
+    print("\n--- Running Multithreaded Batch Pipeline Audit ---")
+    batch_prompts = [
+        "X:1\nT:Batch 1\nM:4/4\nK:C\nCDEF GABc |",
+        "Verse: Midnight riding under neon streetlights",
+        "夜空中最亮的星 能否听清",
+        "<|im_start|>system\nCompose a song.<|im_end|>",
+        "Supercalifragilisticexpialidocious",
+    ]
+
+    ref_batch = [ref_enc.encode(p, allowed_special="all") for p in batch_prompts]
+    sov_batch = sov_enc.encode_batch(batch_prompts, allowed_special="all", num_threads=4)
+    assert ref_batch == sov_batch, "encode_batch returned divergent output"
+
+    sov_decoded_batch = sov_enc.decode_batch(sov_batch, num_threads=4)
+    assert sov_decoded_batch == batch_prompts, "decode_batch roundtrip divergence"
+    print("  [+] Concurrent batch encoding and decoding: PASSED (100% bit-exact across threads)")
 
 
 def run_thread_safety_soak(sov_enc: tiktalkin.Encoding, threads: int = 8, passes_per_thread: int = 5000) -> None:
@@ -220,22 +311,47 @@ def main() -> None:
         base64.b64decode(t): int(r)
         for t, r in (line.split() for line in vocab_path.read_bytes().splitlines() if line)
     }
-    specials = [
-        "<|endoftext|>", "<|im_start|>", "<|im_end|>", "<R>", "<S>", "<X>", "<mask>", "<sep>"
-    ]
-    specials += [f"<extra_{i}>" for i in range(200)]
-    specials[204:206] = ["<abc>", "</abc>"]
+    specials_dict = {
+        "<|endoftext|>": 151643,
+        "<|im_start|>": 151644,
+        "<|im_end|>": 151645,
+        "<R>": 151646,
+        "<S>": 151647,
+        "<X>": 151648,
+        "<mask >": 151649,
+        "<sep>": 151650,
+    }
+    for i in range(196):
+        specials_dict[f"<extra_{i}>"] = 151651 + i
+    specials_dict["<abc>"] = 151847
+    specials_dict["</abc>"] = 151848
+    specials_dict["<extra_198>"] = 151849
+    specials_dict["<extra_199>"] = 151850
+    specials_dict["<music_start>"] = 151851
+    specials_dict["<music_end>"] = 151852
+    specials_dict["<latent_start>"] = 184621
+    specials_dict["<latent_end>"] = 184622
+    specials_dict["<latent_pad>"] = 184623
+
     pattern = (
         r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|"
         r" ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
     )
 
-    ref_enc = tiktoken.Encoding("YuE2", pat_str=pattern, mergeable_ranks=ranks, special_tokens={s: i + len(ranks) for i, s in enumerate(specials)})
-    sov_enc = tiktalkin.Encoding("YuE2", ranks_path=RANKS_BIN)
-
-    run_differential_matrix(ref_enc, sov_enc)
-    run_thread_safety_soak(sov_enc, threads=8, passes_per_thread=5000)
-    run_memory_soak(sov_enc, cycles=25000)
+    ref_enc = tiktoken.Encoding(
+        "YuE2",
+        pat_str=pattern,
+        mergeable_ranks=ranks,
+        special_tokens=specials_dict,
+    )
+    
+    with tiktalkin.Encoding("YuE2", ranks_path=RANKS_BIN) as sov_enc:
+        run_differential_matrix(ref_enc, sov_enc)
+        run_special_token_edgecases(ref_enc, sov_enc)
+        run_agentic_prefix_splicing_audit(sov_enc)
+        run_batch_pipeline_audit(ref_enc, sov_enc)
+        run_thread_safety_soak(sov_enc, threads=8, passes_per_thread=5000)
+        run_memory_soak(sov_enc, cycles=25000)
 
     print("\n" + "=" * 84)
     print("ALL TESTS PASSED: BIT-EXACT, THREAD-SAFE, ZERO-LEAK SUPREMACY CONFIRMED.")
